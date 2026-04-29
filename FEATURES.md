@@ -93,13 +93,15 @@ This file follows the `FEATURES.md` format described at [features.md](https://fe
   - [ ] Vulnerable and patched harness outcomes are captured automatically
 
 ### Fix Generation And Revalidation
-- **Stability**: planned
-- **Description**: Generate or apply a candidate fix, rerun validation, and prove the fix blocks the same behavior seen in the vulnerable harness.
+- **Stability**: stable
+- **Description**: Synthesize a candidate fix from the upstream patched release, apply it to a copy of the vulnerable tree, and structurally re-validate that it converges with the patched release on all affected files without touching anything else.
 - **Properties**:
-  - Fix artifacts are stored alongside the run
-  - Revalidation compares vulnerable, patched, and fixed outcomes
-  - Successful end-to-end runs are promotable to the CVE root
+  - `FixDeveloperAgent` writes `fix/candidate.patch`, `fix/applied/package/`, and `fix/README.md` for supported runs
+  - The applied tree converges to the patched tree byte-for-byte on every affected file
+  - The candidate is rejected as non-minimal if it changes any file outside the recorded affected list
+  - `pipeline_status.json` records `fix_generated`, `fix_validated`, and `defensive_pipeline_completed`
+  - Root-level artifact promotion is gated on `defensive_pipeline_completed`
 - **Test Criteria**:
-  - [ ] Candidate fix artifacts are generated
-  - [ ] Fix validation results are recorded in `pipeline_status.json`
-  - [ ] Root-level promotion happens only after a fully successful end-to-end run
+  - [x] Candidate fix artifacts are generated
+  - [x] Fix validation results are recorded in `pipeline_status.json`
+  - [x] Root-level promotion happens only after a fully successful defensive end-to-end run

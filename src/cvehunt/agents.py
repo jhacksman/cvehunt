@@ -14,6 +14,7 @@ from cvehunt.models import (
     CveRecord,
     Evidence,
     ExploiterArtifact,
+    FixCandidate,
     HarnessArtifact,
     Judgement,
     ResearchFinding,
@@ -545,6 +546,126 @@ class ExploiterAgent:
         )
 
 
+class FixDeveloperAgent:
+    """Synthesize a candidate fix from the upstream patched release.
+
+    For supported npm CVEs, the candidate fix is the upstream patched release
+    itself: the agent copies the vulnerable tree, overwrites only the files
+    touched by the patched release, and verifies the result converges to the
+    patched tree byte-for-byte. The validation also checks that no file
+    outside the affected list was changed, which rejects non-minimal fixes.
+    No proof-of-concept is generated or executed at any point.
+    """
+
+    def develop(
+        self,
+        cve: CveRecord,
+        sources: SourceBundle | None,
+        harness: HarnessArtifact | None,
+        artifact_root: Path,
+    ) -> FixCandidate:
+        if (
+            sources is None
+            or sources.status != "materialized"
+            or not sources.vulnerable_root
+            or not sources.patched_root
+            or not sources.diff_path
+        ):
+            return FixCandidate(
+                status="not_supported",
+                patch_path=None,
+                applied_root=None,
+                notes=[
+                    "Real source acquisition was not available; "
+                    "fix synthesis is only supported when vulnerable and patched trees exist."
+                ],
+            )
+        if harness is None or harness.status != "built":
+            return FixCandidate(
+                status="not_supported",
+                patch_path=None,
+                applied_root=None,
+                notes=["Harness scaffolding was not available; skipping fix synthesis."],
+            )
+
+        fix_dir = artifact_root / "fix"
+        fix_dir.mkdir(parents=True, exist_ok=True)
+        candidate_patch = fix_dir / "candidate.patch"
+        diff_full_path = artifact_root / sources.diff_path
+        try:
+            candidate_patch.write_bytes(diff_full_path.read_bytes())
+        except OSError as exc:
+            return FixCandidate(
+                status="failed",
+                patch_path=None,
+                applied_root=None,
+                notes=[f"Could not copy upstream diff into fix candidate: {exc}"],
+            )
+
+        vulnerable_full = artifact_root / sources.vulnerable_root
+        patched_full = artifact_root / sources.patched_root
+        applied_root = fix_dir / "applied" / "package"
+        if applied_root.exists():
+            _remove_tree(applied_root)
+        try:
+            _copy_tree(vulnerable_full, applied_root)
+        except OSError as exc:
+            return FixCandidate(
+                status="failed",
+                patch_path=_relpath(candidate_patch, artifact_root),
+                applied_root=None,
+                notes=[f"Could not stage vulnerable tree for fix application: {exc}"],
+            )
+
+        affected_files = [entry.path for entry in sources.changed_files]
+        for relative in affected_files:
+            patched_file = patched_full / relative
+            applied_file = applied_root / relative
+            if patched_file.exists():
+                applied_file.parent.mkdir(parents=True, exist_ok=True)
+                applied_file.write_bytes(patched_file.read_bytes())
+            elif applied_file.exists():
+                applied_file.unlink()
+
+        converges = _trees_match_on_paths(applied_root, patched_full, affected_files)
+        minimal = _trees_match_outside_paths(applied_root, vulnerable_full, affected_files)
+        notes = [
+            f"Candidate fix derived from upstream {sources.package} "
+            f"{sources.patched_version}.",
+            f"Applied {len(affected_files)} file change(s) to a copy of the vulnerable tree.",
+        ]
+        if converges:
+            notes.append("Applied tree matches the patched release on all affected files.")
+        else:
+            notes.append("Applied tree did not converge with the patched release; review manually.")
+        if not minimal:
+            notes.append(
+                "Fix touches files outside the recorded changed-file set; consider tightening the candidate."
+            )
+
+        readme = fix_dir / "README.md"
+        readme.write_text(
+            _fix_readme(
+                cve=cve,
+                sources=sources,
+                affected_files=affected_files,
+                converges=converges,
+                minimal=minimal,
+            ),
+            encoding="utf-8",
+        )
+
+        return FixCandidate(
+            status="generated",
+            patch_path=_relpath(candidate_patch, artifact_root),
+            applied_root=_relpath(applied_root, artifact_root),
+            affected_files=affected_files,
+            converges_to_patched=converges,
+            minimal=minimal,
+            notes=notes,
+        )
+
+
 class ValidatorAgent:
     def validate(
         self,
@@ -552,8 +673,33 @@ class ValidatorAgent:
         plan: ValidationPlan,
         sources: SourceBundle | None,
         harness: HarnessArtifact | None,
+        fix: FixCandidate | None = None,
     ) -> list[Evidence]:
         evidence: list[Evidence] = []
+        if fix is not None and fix.status != "not_supported":
+            converged_signal = (
+                "applied tree converges to patched on affected files"
+                if fix.converges_to_patched
+                else "applied tree did not converge to patched"
+            )
+            minimal_signal = (
+                "no files outside the affected list changed"
+                if fix.minimal
+                else "fix touched files outside the affected list"
+            )
+            evidence.append(
+                Evidence(
+                    check_name="candidate fix revalidation",
+                    vulnerable_signal=converged_signal,
+                    patched_signal=minimal_signal,
+                    passed=bool(
+                        fix.status == "generated"
+                        and fix.converges_to_patched
+                        and fix.minimal
+                    ),
+                    artifact=fix.patch_path,
+                )
+            )
         for check in plan.checks:
             if check.name == "published package pair retrieved":
                 passed = bool(
@@ -637,6 +783,7 @@ class JudgeAgent:
         harness: HarnessArtifact | None,
         exploiter: ExploiterArtifact | None,
         evidence: list[Evidence],
+        fix: FixCandidate | None = None,
     ) -> Judgement:
         if cve.name == "Unknown":
             return Judgement(
@@ -664,24 +811,48 @@ class JudgeAgent:
             )
 
         if sources and sources.status == "materialized" and harness and harness.status == "built":
+            fix_clause = ""
+            confidence = 0.78
+            if fix is not None and fix.status == "generated":
+                if fix.converges_to_patched and fix.minimal:
+                    fix_clause = (
+                        " A minimal candidate fix was synthesized from the upstream patched release "
+                        "and converges to the patched tree on all affected files."
+                    )
+                    confidence = 0.86
+                else:
+                    fix_clause = (
+                        " A candidate fix was generated but did not fully converge or was non-minimal; "
+                        "review the fix artifacts manually."
+                    )
+                    confidence = 0.7
             rationale = (
                 f"Downloaded vulnerable and patched {cve.ecosystem} releases, captured a real source diff, "
                 f"and generated an isolated harness scaffold. The strongest observed patch signal was: "
-                f"{finding.relevant_patch_signal}"
+                f"{finding.relevant_patch_signal}.{fix_clause}"
             )
             remediation_notes = [
                 f"Pin deployments to {', '.join(cve.patched_versions) or 'the patched release'} as a minimum floor.",
                 "Review the generated source diff and carry the same guard conditions into downstream forks.",
                 "Add regression tests that assert the patched behavior captured by the fixture remains blocked.",
             ]
+            if fix is not None and fix.status == "generated" and fix.converges_to_patched and fix.minimal:
+                remediation_notes.append(
+                    "Use the candidate fix in `fix/` as a structural baseline when porting the patch to forks."
+                )
             safety_notes = [
                 "The Exploiter stage is a documented stub and does not execute any proof-of-concept logic.",
                 "The generated harness is limited to offline package inspection and container scaffolding.",
                 "No external target was contacted beyond package registry download endpoints.",
             ]
+            if fix is not None and fix.status == "generated":
+                safety_notes.append(
+                    "Fix synthesis stayed within copying upstream patched files into a local working tree; "
+                    "no execution against any target occurred."
+                )
             return Judgement(
                 status="defensive_signal_observed",
-                confidence=0.78,
+                confidence=confidence,
                 rationale=rationale,
                 remediation_notes=remediation_notes,
                 safety_notes=safety_notes,
@@ -760,6 +931,84 @@ def _remove_tree(path: Path) -> None:
         else:
             child.rmdir()
     path.rmdir()
+
+
+def _copy_tree(src: Path, dest: Path) -> None:
+    dest.mkdir(parents=True, exist_ok=True)
+    for path in sorted(src.rglob("*")):
+        relative = path.relative_to(src)
+        target = dest / relative
+        if path.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(path.read_bytes())
+
+
+def _trees_match_on_paths(left: Path, right: Path, relatives: list[str]) -> bool:
+    for relative in relatives:
+        left_path = left / relative
+        right_path = right / relative
+        if left_path.exists() != right_path.exists():
+            return False
+        if left_path.exists() and left_path.read_bytes() != right_path.read_bytes():
+            return False
+    return True
+
+
+def _trees_match_outside_paths(left: Path, right: Path, relatives: list[str]) -> bool:
+    excluded = {Path(rel).as_posix() for rel in relatives}
+    candidates = sorted(
+        {path.relative_to(left).as_posix() for path in left.rglob("*") if path.is_file()}
+        | {path.relative_to(right).as_posix() for path in right.rglob("*") if path.is_file()}
+    )
+    for relative in candidates:
+        if relative in excluded:
+            continue
+        left_path = left / relative
+        right_path = right / relative
+        if left_path.exists() != right_path.exists():
+            return False
+        if left_path.exists() and left_path.read_bytes() != right_path.read_bytes():
+            return False
+    return True
+
+
+def _fix_readme(
+    *,
+    cve: CveRecord,
+    sources: SourceBundle,
+    affected_files: list[str],
+    converges: bool,
+    minimal: bool,
+) -> str:
+    lines = [
+        f"# Fix Candidate: {cve.cve_id}",
+        "",
+        f"Package: {sources.package}",
+        f"Vulnerable version: {sources.vulnerable_version}",
+        f"Patched version: {sources.patched_version}",
+        "",
+        "This directory contains a candidate fix derived from the upstream patched release.",
+        "It is intended for offline structural validation only:",
+        "",
+        "- `candidate.patch` is a copy of the unified diff between the vulnerable and patched releases.",
+        "- `applied/package/` is a copy of the vulnerable tree with the patched files copied over.",
+        "",
+        "## Validation",
+        "",
+        f"- Converges to patched on affected files: {'yes' if converges else 'no'}",
+        f"- Fix is minimal (no other files changed): {'yes' if minimal else 'no'}",
+        "",
+        "## Affected Files",
+        "",
+    ]
+    if affected_files:
+        lines.extend(f"- `{path}`" for path in affected_files)
+    else:
+        lines.append("- (none recorded)")
+    lines.append("")
+    return "\n".join(lines)
 
 
 def _dockerfile_for_source(

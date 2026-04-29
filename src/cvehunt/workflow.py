@@ -6,6 +6,7 @@ from pathlib import Path
 from cvehunt.agents import (
     CollectorAgent,
     ExploiterAgent,
+    FixDeveloperAgent,
     HarnessBuilderAgent,
     JudgeAgent,
     ResearcherAgent,
@@ -22,6 +23,7 @@ class CveHuntWorkflow:
         self.researcher = ResearcherAgent()
         self.builder = HarnessBuilderAgent()
         self.exploiter = ExploiterAgent()
+        self.fix_developer = FixDeveloperAgent()
         self.validator = ValidatorAgent()
         self.judge = JudgeAgent()
         self.last_artifact_root: Path | None = None
@@ -83,7 +85,25 @@ class CveHuntWorkflow:
                 status=exploiter.status,
             )
         )
-        evidence = self.validator.validate(cve, plan, sources, harness)
+        fix = self.fix_developer.develop(cve, sources, harness, self.last_artifact_root)
+        if fix.status == "generated":
+            fix_status = "completed" if fix.converges_to_patched and fix.minimal else "incomplete"
+            fix_message = (
+                f"Generated candidate fix touching {len(fix.affected_files)} file(s); "
+                f"converges={fix.converges_to_patched}, minimal={fix.minimal}"
+            )
+        else:
+            fix_status = fix.status
+            fix_message = fix.notes[0] if fix.notes else "Fix synthesis was skipped."
+        events.append(
+            TraceEvent(
+                phase="Fix Developer",
+                message=fix_message,
+                artifact=fix.patch_path,
+                status=fix_status,
+            )
+        )
+        evidence = self.validator.validate(cve, plan, sources, harness, fix)
         events.append(
             TraceEvent(
                 phase="Validator",
@@ -93,7 +113,7 @@ class CveHuntWorkflow:
                 ),
             )
         )
-        judgement = self.judge.judge(cve, finding, sources, harness, exploiter, evidence)
+        judgement = self.judge.judge(cve, finding, sources, harness, exploiter, evidence, fix)
         events.append(
             TraceEvent(
                 phase="Judge",
@@ -114,5 +134,6 @@ class CveHuntWorkflow:
             plan=plan,
             evidence=evidence,
             judgement=judgement,
+            fix=fix,
         )
         return report, events

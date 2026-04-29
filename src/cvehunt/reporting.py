@@ -29,7 +29,7 @@ FULL_PIPELINE_PHASES = [
     {
         "phase": "Fix Developer",
         "goal": "Generate or apply a candidate source fix and re-validate it.",
-        "implemented": False,
+        "implemented": True,
     },
     {
         "phase": "Validator",
@@ -52,6 +52,7 @@ def render_markdown(report: WorkflowReport) -> str:
     sources = data["sources"]
     harness = data["harness"]
     exploiter = data["exploiter"]
+    fix = data.get("fix")
     judgement = data["judgement"]
     evidence = data["evidence"]
 
@@ -143,6 +144,26 @@ def render_markdown(report: WorkflowReport) -> str:
             ]
         )
 
+    lines.extend(["", "## Fix Candidate", ""])
+    if fix:
+        lines.extend(
+            [
+                f"- Status: {fix['status']}",
+                f"- Patch artifact: {fix.get('patch_path') or 'n/a'}",
+                f"- Applied tree: {fix.get('applied_root') or 'n/a'}",
+                f"- Converges to patched: {'yes' if fix.get('converges_to_patched') else 'no'}",
+                f"- Minimal (no other files changed): {'yes' if fix.get('minimal') else 'no'}",
+            ]
+        )
+        if fix.get("affected_files"):
+            lines.append("- Affected files:")
+            lines.extend(f"  - {path}" for path in fix["affected_files"])
+        if fix.get("notes"):
+            lines.append("- Notes:")
+            lines.extend(f"  - {note}" for note in fix["notes"])
+    else:
+        lines.append("- Status: not_run")
+
     lines.extend(["", "## Validation Plan", ""])
     lines.extend(
         [
@@ -180,8 +201,18 @@ def render_markdown(report: WorkflowReport) -> str:
             f"- Real package sources acquired: {'yes' if sources and sources['status'] == 'materialized' else 'no'}",
             f"- Harness scaffold generated: {'yes' if harness and harness['status'] == 'built' else 'no'}",
             f"- Full exploit generated: {'yes' if exploiter and exploiter['implemented'] else 'no'}",
-            "- Source patch generated: no",
-            "- Fix validation complete: no",
+            f"- Source patch generated: {'yes' if fix and fix.get('status') == 'generated' else 'no'}",
+            (
+                "- Fix validation complete: "
+                + (
+                    "yes"
+                    if fix
+                    and fix.get("status") == "generated"
+                    and fix.get("converges_to_patched")
+                    and fix.get("minimal")
+                    else "no"
+                )
+            ),
             "",
             "## Judgement",
             "",
@@ -239,12 +270,28 @@ def render_pipeline_status(
         notes.extend(report.harness.notes)
     if report.exploiter:
         notes.append(report.exploiter.message)
-    notes.append("No source fix generation or fix validation stage is implemented in this run.")
+    if report.fix is not None:
+        notes.extend(report.fix.notes)
+    else:
+        notes.append("No source fix generation or fix validation stage is implemented in this run.")
 
     exploit_generated = bool(report.exploiter and report.exploiter.implemented)
-    fix_generated = False
-    fix_validated = False
+    fix_generated = bool(report.fix and report.fix.status == "generated")
+    fix_validated = bool(
+        report.fix
+        and report.fix.status == "generated"
+        and report.fix.converges_to_patched
+        and report.fix.minimal
+    )
     requested_full_pipeline_completed = exploit_generated and fix_generated and fix_validated
+    defensive_pipeline_completed = bool(
+        report.sources
+        and report.sources.status == "materialized"
+        and report.harness
+        and report.harness.status == "built"
+        and fix_generated
+        and fix_validated
+    )
 
     return {
         "cve_id": report.cve.cve_id,
@@ -254,6 +301,7 @@ def render_pipeline_status(
         "confidence": report.judgement.confidence,
         "furthest_completed_stage": events[-1].phase if events else None,
         "requested_full_pipeline_completed": requested_full_pipeline_completed,
+        "defensive_pipeline_completed": defensive_pipeline_completed,
         "exploit_generated": exploit_generated,
         "fix_generated": fix_generated,
         "fix_validated": fix_validated,

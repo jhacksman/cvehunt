@@ -78,7 +78,13 @@ def test_known_cve_produces_defensive_signal(monkeypatch, tmp_path) -> None:
     assert report.harness.status == "built"
     assert report.exploiter is not None
     assert report.exploiter.status == "stubbed"
+    assert report.fix is not None
+    assert report.fix.status == "generated"
+    assert report.fix.converges_to_patched is True
+    assert report.fix.minimal is True
+    assert report.fix.affected_files == ["index.js"]
     assert report.judgement.status == "defensive_signal_observed"
+    assert report.evidence[0].check_name == "candidate fix revalidation"
     assert report.evidence[0].passed is True
     assert "The Exploiter stage is a documented stub" in report.judgement.safety_notes[0]
 
@@ -123,16 +129,26 @@ def test_persisted_run_writes_workdir_artifacts(monkeypatch, tmp_path) -> None:
     assert (run_dir / "research" / "source_diff.patch").exists()
     assert (run_dir / "harness" / "README.md").exists()
     assert (run_dir / "exploiter" / "README.md").exists()
-    assert not (cve_dir / "report.json").exists()
+    assert (run_dir / "fix" / "candidate.patch").exists()
+    assert (run_dir / "fix" / "applied" / "package" / "index.js").exists()
+    assert (run_dir / "fix" / "README.md").exists()
+    assert (cve_dir / "report.json").exists()
+    assert (cve_dir / "pipeline_status.json").exists()
     trace = (run_dir / "trace.jsonl").read_text(encoding="utf-8")
     assert "Harness Builder" in trace
     assert "Exploiter" in trace
+    assert "Fix Developer" in trace
     pipeline_status = (run_dir / "pipeline_status.json").read_text(encoding="utf-8")
     assert '"status": "stubbed"' in pipeline_status
     assert '"requested_full_pipeline_completed": false' in pipeline_status
+    assert '"defensive_pipeline_completed": true' in pipeline_status
+    assert '"fix_generated": true' in pipeline_status
+    assert '"fix_validated": true' in pipeline_status
     report_md = (run_dir / "report.md").read_text(encoding="utf-8")
     assert "Model: unspecified" in report_md
     assert "Real package sources acquired: yes" in report_md
+    assert "Source patch generated: yes" in report_md
+    assert "Fix validation complete: yes" in report_md
 
 
 def test_dashboard_includes_tracked_cves(tmp_path) -> None:
@@ -154,6 +170,102 @@ def test_dashboard_includes_tracked_cves(tmp_path) -> None:
         )
         == "https://github.com/pierce403/cvehunt/tree/main/cves/CVE-2025-55182"
     )
+
+
+def test_fix_developer_preserves_minimality_when_unrelated_files_diverge(monkeypatch, tmp_path) -> None:
+    """The candidate fix should only pull in patched content for files in changed_files.
+    Files outside that list should stay as their vulnerable version even when the
+    patched release happens to differ on them."""
+    from cvehunt.agents import FixDeveloperAgent
+    from cvehunt.models import HarnessArtifact
+
+    artifact_root = tmp_path / "artifacts"
+    vulnerable_root = artifact_root / "sources" / "vulnerable" / "package"
+    patched_root = artifact_root / "sources" / "patched" / "package"
+    research_dir = artifact_root / "research"
+    vulnerable_root.mkdir(parents=True)
+    patched_root.mkdir(parents=True)
+    research_dir.mkdir(parents=True)
+    (vulnerable_root / "index.js").write_text("vuln\n", encoding="utf-8")
+    (vulnerable_root / "unrelated.js").write_text("same\n", encoding="utf-8")
+    (patched_root / "index.js").write_text("patched\n", encoding="utf-8")
+    (patched_root / "unrelated.js").write_text("CHANGED\n", encoding="utf-8")
+    (research_dir / "source_diff.patch").write_text("--- a/index.js\n+++ b/index.js\n", encoding="utf-8")
+
+    cve = CveRecord(
+        cve_id="CVE-TEST-0001",
+        name="Test",
+        summary="unsafe deserialization in test package",
+        cvss=9.0,
+        disclosed="2026-01-01",
+        ecosystem="npm",
+        vulnerable_versions=["pkg 1.0.0"],
+        patched_versions=["pkg 1.0.1"],
+    )
+    sources = SourceBundle(
+        status="materialized",
+        ecosystem="npm",
+        package="pkg",
+        vulnerable_version="1.0.0",
+        patched_version="1.0.1",
+        vulnerable_tarball_url=None,
+        patched_tarball_url=None,
+        vulnerable_tarball_sha256=None,
+        patched_tarball_sha256=None,
+        vulnerable_root="sources/vulnerable/package",
+        patched_root="sources/patched/package",
+        diff_path="research/source_diff.patch",
+        changed_files=[ChangedFile(path="index.js", additions=1, deletions=1, patch_signal=None)],
+    )
+    harness = HarnessArtifact(
+        status="built",
+        runtime="test",
+        isolation="test",
+        workspace=".",
+    )
+
+    fix = FixDeveloperAgent().develop(cve, sources, harness, artifact_root)
+
+    assert fix.status == "generated"
+    assert fix.affected_files == ["index.js"]
+    assert fix.converges_to_patched is True
+    assert fix.minimal is True
+    assert (artifact_root / "fix" / "applied" / "package" / "unrelated.js").read_text() == "same\n"
+
+
+def test_fix_developer_skipped_when_sources_not_supported(tmp_path) -> None:
+    from cvehunt.agents import FixDeveloperAgent
+
+    cve = CveRecord(
+        cve_id="CVE-TEST-0002",
+        name="Test",
+        summary="x",
+        cvss=None,
+        disclosed="2026-01-01",
+        ecosystem="pypi",
+        vulnerable_versions=[],
+        patched_versions=[],
+    )
+    sources = SourceBundle(
+        status="not_supported",
+        ecosystem="pypi",
+        package=None,
+        vulnerable_version=None,
+        patched_version=None,
+        vulnerable_tarball_url=None,
+        patched_tarball_url=None,
+        vulnerable_tarball_sha256=None,
+        patched_tarball_sha256=None,
+        vulnerable_root=None,
+        patched_root=None,
+        diff_path=None,
+    )
+
+    fix = FixDeveloperAgent().develop(cve, sources, None, tmp_path)
+
+    assert fix.status == "not_supported"
+    assert fix.patch_path is None
+    assert fix.converges_to_patched is False
 
 
 def test_unsupported_ecosystem_without_fixture_fails_differential_check(tmp_path) -> None:
@@ -184,5 +296,7 @@ def test_unsupported_ecosystem_without_fixture_fails_differential_check(tmp_path
     assert report.harness.status == "not_supported"
     assert report.exploiter is not None
     assert report.exploiter.status == "not_supported"
+    assert report.fix is not None
+    assert report.fix.status == "not_supported"
     assert report.evidence[0].passed is False
     assert report.judgement.status == "insufficient_evidence"

@@ -78,7 +78,7 @@ class WorkdirStore:
             pipeline_status,
             artifact_root=artifact_root,
         )
-        if pipeline_status["requested_full_pipeline_completed"]:
+        if pipeline_status.get("defensive_pipeline_completed"):
             self._promote_successful_run(run_directory, directory)
         return report_path
 

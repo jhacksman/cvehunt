@@ -115,6 +115,20 @@ class ExploiterArtifact:
     next_step: str
 
 
+FixStatus = Literal["generated", "not_supported", "failed"]
+
+
+@dataclass(frozen=True)
+class FixCandidate:
+    status: FixStatus
+    patch_path: str | None
+    applied_root: str | None
+    affected_files: list[str] = field(default_factory=list)
+    converges_to_patched: bool = False
+    minimal: bool = False
+    notes: list[str] = field(default_factory=list)
+
+
 @dataclass(frozen=True)
 class Evidence:
     check_name: str
@@ -150,6 +164,7 @@ class WorkflowReport:
     plan: ValidationPlan
     evidence: list[Evidence]
     judgement: Judgement
+    fix: FixCandidate | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)

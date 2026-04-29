@@ -67,6 +67,8 @@ npm run build
 - `uv run cvehunt run CVE-2025-55182 --persist --json` now performs a real npm package acquisition for `react-server-dom-webpack 19.0.0` and `19.0.1`, captures a 17-file diff, and records the strongest patch signal around `Object.prototype.hasOwnProperty`.
 - Docker is installed in this environment (`docker --version` succeeded), but the current pipeline generates Dockerfiles and a build helper script rather than automatically building images during the run.
 - The Researcher now classifies SQL injection summaries explicitly. For unsupported ecosystems without fixture coverage, the fallback differential check must fail and the run should end as `insufficient_evidence`, not `needs_human_review`.
+- `FixDeveloperAgent` synthesizes a candidate fix for supported npm CVEs by copying patched files into a working copy of the vulnerable tree under `fix/applied/package/`, writes `fix/candidate.patch` and `fix/README.md`, and exposes `converges_to_patched` plus `minimal` properties. The Validator inserts a `candidate fix revalidation` evidence row before the existing checks. The Judge bumps confidence from 0.78 to 0.86 when the fix converges and is minimal.
+- Root-level promotion now gates on `defensive_pipeline_completed` (real sources + harness + fix generated + fix validated). `requested_full_pipeline_completed` still tracks the original exploit + fix + fix_validated definition for diagnostic purposes; the Exploiter remains a documented stub so that field stays false in this assistant context.
 
 ## Known Issues & Solutions
 
